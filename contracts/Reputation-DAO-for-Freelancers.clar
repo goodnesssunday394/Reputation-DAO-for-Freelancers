@@ -412,3 +412,187 @@
 (define-private (get-freelancer-skill-count (freelancer-id uint))
   u0
 )
+
+(define-constant ERR-ESCROW-NOT-FOUND (err u400))
+(define-constant ERR-ESCROW-ALREADY-EXISTS (err u401))
+(define-constant ERR-INVALID-MILESTONE (err u402))
+(define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u403))
+(define-constant ERR-ESCROW-NOT-ACTIVE (err u404))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u405))
+
+(define-data-var next-escrow-id uint u1)
+
+(define-map escrows
+  { id: uint }
+  {
+    client: principal,
+    freelancer: principal,
+    total-amount: uint,
+    released-amount: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    completed-at: (optional uint)
+  }
+)
+
+(define-map milestones
+  { escrow-id: uint, milestone-index: uint }
+  {
+    description: (string-ascii 200),
+    amount: uint,
+    completed: bool,
+    approved-by-client: bool,
+    completion-date: (optional uint)
+  }
+)
+
+(define-map escrow-milestone-count
+  { escrow-id: uint }
+  { count: uint }
+)
+
+(define-public (create-escrow (freelancer principal) (milestone-amount uint) (milestone-description (string-ascii 200)))
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+    )
+    (asserts! (> milestone-amount u0) ERR-INVALID-MILESTONE)
+    (asserts! (>= (ft-get-balance reputation-token tx-sender) milestone-amount) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (ft-transfer? reputation-token milestone-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrows
+      { id: escrow-id }
+      {
+        client: tx-sender,
+        freelancer: freelancer,
+        total-amount: milestone-amount,
+        released-amount: u0,
+        status: "active",
+        created-at: burn-block-height,
+        completed-at: none
+      }
+    )
+    
+    (map-set escrow-milestone-count
+      { escrow-id: escrow-id }
+      { count: u1 }
+    )
+    
+    (unwrap-panic (create-single-milestone escrow-id u0 milestone-amount milestone-description))
+    
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-private (create-single-milestone (escrow-id uint) (milestone-index uint) (amount uint) (description (string-ascii 200)))
+  (begin
+    (map-set milestones
+      { escrow-id: escrow-id, milestone-index: milestone-index }
+      {
+        description: description,
+        amount: amount,
+        completed: false,
+        approved-by-client: false,
+        completion-date: none
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-milestone (escrow-id uint) (milestone-index uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { id: escrow-id }) ERR-ESCROW-NOT-FOUND))
+      (milestone (unwrap! (map-get? milestones { escrow-id: escrow-id, milestone-index: milestone-index }) ERR-INVALID-MILESTONE))
+    )
+    (asserts! (is-eq tx-sender (get freelancer escrow)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status escrow) "active") ERR-ESCROW-NOT-ACTIVE)
+    (asserts! (not (get completed milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+    
+    (map-set milestones
+      { escrow-id: escrow-id, milestone-index: milestone-index }
+      (merge milestone {
+        completed: true,
+        completion-date: (some burn-block-height)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (approve-milestone (escrow-id uint) (milestone-index uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { id: escrow-id }) ERR-ESCROW-NOT-FOUND))
+      (milestone (unwrap! (map-get? milestones { escrow-id: escrow-id, milestone-index: milestone-index }) ERR-INVALID-MILESTONE))
+    )
+    (asserts! (is-eq tx-sender (get client escrow)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status escrow) "active") ERR-ESCROW-NOT-ACTIVE)
+    (asserts! (get completed milestone) ERR-INVALID-MILESTONE)
+    (asserts! (not (get approved-by-client milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+    
+    (map-set milestones
+      { escrow-id: escrow-id, milestone-index: milestone-index }
+      (merge milestone { approved-by-client: true })
+    )
+    
+    (try! (ft-transfer? reputation-token (get amount milestone) (as-contract tx-sender) (get freelancer escrow)))
+    
+    (map-set escrows
+      { id: escrow-id }
+      (merge escrow { released-amount: (+ (get released-amount escrow) (get amount milestone)) })
+    )
+    
+    (if (is-eq (+ (get released-amount escrow) (get amount milestone)) (get total-amount escrow))
+      (map-set escrows { id: escrow-id } (merge escrow { status: "completed", completed-at: (some burn-block-height) }))
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-escrow-on-dispute (escrow-id uint) (dispute-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { id: escrow-id }) ERR-ESCROW-NOT-FOUND))
+      (dispute (unwrap! (map-get? disputes { id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+    )
+    (asserts! (is-eq (get status dispute) "resolved-favor") ERR-DISPUTE-NOT-FOUND)
+    (asserts! (is-eq (get status escrow) "active") ERR-ESCROW-NOT-ACTIVE)
+    
+    (let
+      (
+        (remaining-amount (- (get total-amount escrow) (get released-amount escrow)))
+      )
+      (try! (ft-transfer? reputation-token remaining-amount (as-contract tx-sender) (get freelancer escrow)))
+      
+      (map-set escrows
+        { id: escrow-id }
+        (merge escrow {
+          released-amount: (get total-amount escrow),
+          status: "completed",
+          completed-at: (some burn-block-height)
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-escrow-details (escrow-id uint))
+  (map-get? escrows { id: escrow-id })
+)
+
+(define-read-only (get-milestone-details (escrow-id uint) (milestone-index uint))
+  (map-get? milestones { escrow-id: escrow-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-escrow-milestone-count (escrow-id uint))
+  (map-get? escrow-milestone-count { escrow-id: escrow-id })
+)
