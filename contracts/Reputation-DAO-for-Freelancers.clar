@@ -596,3 +596,264 @@
 (define-read-only (get-escrow-milestone-count (escrow-id uint))
   (map-get? escrow-milestone-count { escrow-id: escrow-id })
 )
+
+(define-constant ERR-REWARD-ALREADY-CLAIMED (err u500))
+(define-constant ERR-INSUFFICIENT-PERFORMANCE (err u501))
+(define-constant ERR-REWARD-COOLDOWN-ACTIVE (err u502))
+(define-constant ERR-NO-REWARDS-AVAILABLE (err u503))
+
+(define-data-var rating-milestone-reward uint u50)
+(define-data-var completion-bonus-reward uint u100)
+(define-data-var premium-status-reward uint u200)
+(define-data-var reward-cooldown-blocks uint u1008)
+
+(define-map user-rewards
+  { user: principal }
+  {
+    total-earned: uint,
+    last-claim-block: uint,
+    rating-milestones-claimed: uint,
+    completion-bonuses-claimed: uint,
+    premium-rewards-claimed: uint
+  }
+)
+
+(define-map achievement-milestones
+  { user: principal, milestone-type: (string-ascii 20), milestone-value: uint }
+  {
+    achieved: bool,
+    achieved-at: uint,
+    reward-amount: uint,
+    claimed: bool
+  }
+)
+
+(define-map reward-distribution-history
+  { user: principal, block-height: uint }
+  {
+    reward-type: (string-ascii 20),
+    amount: uint,
+    trigger-event: (string-ascii 50)
+  }
+)
+
+(define-public (claim-rating-milestone-reward (freelancer-id uint))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (user-reward (default-to 
+        { total-earned: u0, last-claim-block: u0, rating-milestones-claimed: u0, completion-bonuses-claimed: u0, premium-rewards-claimed: u0 }
+        (map-get? user-rewards { user: tx-sender })
+      ))
+      (total-ratings (get total-ratings freelancer))
+      (average-rating (get average-rating freelancer))
+    )
+    (asserts! (is-eq tx-sender (get address freelancer)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (- burn-block-height (get last-claim-block user-reward)) (var-get reward-cooldown-blocks)) ERR-REWARD-COOLDOWN-ACTIVE)
+    (asserts! (and (>= total-ratings u10) (>= average-rating u75)) ERR-INSUFFICIENT-PERFORMANCE)
+    
+    (let
+      (
+        (reward-amount (var-get rating-milestone-reward))
+        (milestone-key { user: tx-sender, milestone-type: "rating", milestone-value: total-ratings })
+        (existing-milestone (map-get? achievement-milestones milestone-key))
+      )
+      (asserts! (or (is-none existing-milestone) (not (get claimed (unwrap-panic existing-milestone)))) ERR-REWARD-ALREADY-CLAIMED)
+      
+      (try! (ft-mint? reputation-token reward-amount tx-sender))
+      
+      (map-set user-rewards
+        { user: tx-sender }
+        {
+          total-earned: (+ (get total-earned user-reward) reward-amount),
+          last-claim-block: burn-block-height,
+          rating-milestones-claimed: (+ (get rating-milestones-claimed user-reward) u1),
+          completion-bonuses-claimed: (get completion-bonuses-claimed user-reward),
+          premium-rewards-claimed: (get premium-rewards-claimed user-reward)
+        }
+      )
+      
+      (map-set achievement-milestones
+        milestone-key
+        {
+          achieved: true,
+          achieved-at: burn-block-height,
+          reward-amount: reward-amount,
+          claimed: true
+        }
+      )
+      
+      (map-set reward-distribution-history
+        { user: tx-sender, block-height: burn-block-height }
+        {
+          reward-type: "rating-milestone",
+          amount: reward-amount,
+          trigger-event: "high-rating-achievement"
+        }
+      )
+      
+      (ok reward-amount)
+    )
+  )
+)
+
+(define-public (claim-completion-bonus (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { id: escrow-id }) ERR-ESCROW-NOT-FOUND))
+      (user-reward (default-to 
+        { total-earned: u0, last-claim-block: u0, rating-milestones-claimed: u0, completion-bonuses-claimed: u0, premium-rewards-claimed: u0 }
+        (map-get? user-rewards { user: tx-sender })
+      ))
+    )
+    (asserts! (is-eq tx-sender (get freelancer escrow)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status escrow) "completed") ERR-ESCROW-NOT-ACTIVE)
+    (asserts! (>= (- burn-block-height (get last-claim-block user-reward)) (var-get reward-cooldown-blocks)) ERR-REWARD-COOLDOWN-ACTIVE)
+    
+    (let
+      (
+        (reward-amount (var-get completion-bonus-reward))
+        (milestone-key { user: tx-sender, milestone-type: "completion", milestone-value: escrow-id })
+        (existing-milestone (map-get? achievement-milestones milestone-key))
+      )
+      (asserts! (or (is-none existing-milestone) (not (get claimed (unwrap-panic existing-milestone)))) ERR-REWARD-ALREADY-CLAIMED)
+      
+      (try! (ft-mint? reputation-token reward-amount tx-sender))
+      
+      (map-set user-rewards
+        { user: tx-sender }
+        {
+          total-earned: (+ (get total-earned user-reward) reward-amount),
+          last-claim-block: burn-block-height,
+          rating-milestones-claimed: (get rating-milestones-claimed user-reward),
+          completion-bonuses-claimed: (+ (get completion-bonuses-claimed user-reward) u1),
+          premium-rewards-claimed: (get premium-rewards-claimed user-reward)
+        }
+      )
+      
+      (map-set achievement-milestones
+        milestone-key
+        {
+          achieved: true,
+          achieved-at: burn-block-height,
+          reward-amount: reward-amount,
+          claimed: true
+        }
+      )
+      
+      (map-set reward-distribution-history
+        { user: tx-sender, block-height: burn-block-height }
+        {
+          reward-type: "completion-bonus",
+          amount: reward-amount,
+          trigger-event: "project-completion"
+        }
+      )
+      
+      (ok reward-amount)
+    )
+  )
+)
+
+(define-public (claim-premium-status-reward (freelancer-id uint))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (user-reward (default-to 
+        { total-earned: u0, last-claim-block: u0, rating-milestones-claimed: u0, completion-bonuses-claimed: u0, premium-rewards-claimed: u0 }
+        (map-get? user-rewards { user: tx-sender })
+      ))
+      (is-premium (unwrap! (is-premium-freelancer freelancer-id) ERR-INSUFFICIENT-PERFORMANCE))
+    )
+    (asserts! (is-eq tx-sender (get address freelancer)) ERR-NOT-AUTHORIZED)
+    (asserts! is-premium ERR-INSUFFICIENT-PERFORMANCE)
+    (asserts! (>= (- burn-block-height (get last-claim-block user-reward)) (var-get reward-cooldown-blocks)) ERR-REWARD-COOLDOWN-ACTIVE)
+    
+    (let
+      (
+        (reward-amount (var-get premium-status-reward))
+        (milestone-key { user: tx-sender, milestone-type: "premium", milestone-value: freelancer-id })
+        (existing-milestone (map-get? achievement-milestones milestone-key))
+      )
+      (asserts! (or (is-none existing-milestone) (not (get claimed (unwrap-panic existing-milestone)))) ERR-REWARD-ALREADY-CLAIMED)
+      
+      (try! (ft-mint? reputation-token reward-amount tx-sender))
+      
+      (map-set user-rewards
+        { user: tx-sender }
+        {
+          total-earned: (+ (get total-earned user-reward) reward-amount),
+          last-claim-block: burn-block-height,
+          rating-milestones-claimed: (get rating-milestones-claimed user-reward),
+          completion-bonuses-claimed: (get completion-bonuses-claimed user-reward),
+          premium-rewards-claimed: (+ (get premium-rewards-claimed user-reward) u1)
+        }
+      )
+      
+      (map-set achievement-milestones
+        milestone-key
+        {
+          achieved: true,
+          achieved-at: burn-block-height,
+          reward-amount: reward-amount,
+          claimed: true
+        }
+      )
+      
+      (map-set reward-distribution-history
+        { user: tx-sender, block-height: burn-block-height }
+        {
+          reward-type: "premium-status",
+          amount: reward-amount,
+          trigger-event: "premium-status-achieved"
+        }
+      )
+      
+      (ok reward-amount)
+    )
+  )
+)
+
+(define-read-only (get-user-rewards (user principal))
+  (map-get? user-rewards { user: user })
+)
+
+(define-read-only (get-achievement-milestone (user principal) (milestone-type (string-ascii 20)) (milestone-value uint))
+  (map-get? achievement-milestones { user: user, milestone-type: milestone-type, milestone-value: milestone-value })
+)
+
+(define-read-only (get-reward-history (user principal) (block-number uint))
+  (map-get? reward-distribution-history { user: user, block-height: block-number })
+)
+
+(define-read-only (calculate-pending-rewards (freelancer-id uint))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (user-reward (default-to 
+        { total-earned: u0, last-claim-block: u0, rating-milestones-claimed: u0, completion-bonuses-claimed: u0, premium-rewards-claimed: u0 }
+        (map-get? user-rewards { user: (get address freelancer) })
+      ))
+      (total-ratings (get total-ratings freelancer))
+      (average-rating (get average-rating freelancer))
+      (is-premium (unwrap! (is-premium-freelancer freelancer-id) ERR-NOT-FOUND))
+      (cooldown-passed (>= (- burn-block-height (get last-claim-block user-reward)) (var-get reward-cooldown-blocks)))
+    )
+    (ok {
+      rating-milestone-eligible: (and cooldown-passed (>= total-ratings u10) (>= average-rating u75)),
+      premium-status-eligible: (and cooldown-passed is-premium),
+      potential-rating-reward: (if (and cooldown-passed (>= total-ratings u10) (>= average-rating u75)) (var-get rating-milestone-reward) u0),
+      potential-premium-reward: (if (and cooldown-passed is-premium) (var-get premium-status-reward) u0),
+      blocks-until-next-claim: (if cooldown-passed u0 (- (var-get reward-cooldown-blocks) (- burn-block-height (get last-claim-block user-reward))))
+    })
+  )
+)
+
+(define-read-only (get-reward-system-config)
+  (ok {
+    rating-milestone-reward: (var-get rating-milestone-reward),
+    completion-bonus-reward: (var-get completion-bonus-reward),
+    premium-status-reward: (var-get premium-status-reward),
+    reward-cooldown-blocks: (var-get reward-cooldown-blocks)
+  })
+)
