@@ -857,3 +857,222 @@
     reward-cooldown-blocks: (var-get reward-cooldown-blocks)
   })
 )
+
+(define-constant ERR-ALREADY-REFERRED (err u600))
+(define-constant ERR-SELF-REFERRAL (err u601))
+(define-constant ERR-REFERRER-NOT-QUALIFIED (err u602))
+(define-constant ERR-REFERRAL-EXPIRED (err u603))
+(define-constant ERR-MAX-REFERRALS-REACHED (err u604))
+
+(define-data-var referral-reward-amount uint u150)
+(define-data-var referral-expiry-blocks uint u4320)
+(define-data-var max-referrals-per-user uint u50)
+(define-data-var min-referrer-reputation uint u300)
+
+(define-map referrals
+  { user: principal }
+  {
+    referrer: (optional principal),
+    referral-code: (string-ascii 20),
+    total-referrals: uint,
+    successful-referrals: uint,
+    total-earned-from-referrals: uint,
+    joined-at: uint
+  }
+)
+
+(define-map referral-links
+  { referral-code: (string-ascii 20) }
+  {
+    owner: principal,
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map referral-rewards
+  { referrer: principal, referee: principal }
+  {
+    referrer-reward: uint,
+    referee-reward: uint,
+    claimed-at: uint,
+    referee-qualified: bool
+  }
+)
+
+(define-public (create-referral-code (code (string-ascii 20)))
+  (let
+    (
+      (existing-link (map-get? referral-links { referral-code: code }))
+      (user-referral (map-get? referrals { user: tx-sender }))
+      (user-reputation (ft-get-balance reputation-token tx-sender))
+    )
+    (asserts! (is-none existing-link) ERR-SKILL-ALREADY-EXISTS)
+    (asserts! (>= user-reputation (var-get min-referrer-reputation)) ERR-REFERRER-NOT-QUALIFIED)
+    
+    (map-set referral-links
+      { referral-code: code }
+      {
+        owner: tx-sender,
+        created-at: burn-block-height,
+        active: true
+      }
+    )
+    
+    (if (is-none user-referral)
+      (map-set referrals
+        { user: tx-sender }
+        {
+          referrer: none,
+          referral-code: code,
+          total-referrals: u0,
+          successful-referrals: u0,
+          total-earned-from-referrals: u0,
+          joined-at: burn-block-height
+        }
+      )
+      (map-set referrals
+        { user: tx-sender }
+        (merge (unwrap-panic user-referral) { referral-code: code })
+      )
+    )
+    
+    (ok code)
+  )
+)
+
+(define-public (join-with-referral (referral-code (string-ascii 20)))
+  (let
+    (
+      (referral-link (unwrap! (map-get? referral-links { referral-code: referral-code }) ERR-NOT-FOUND))
+      (referrer (get owner referral-link))
+      (existing-referral (map-get? referrals { user: tx-sender }))
+      (referrer-data (unwrap! (map-get? referrals { user: referrer }) ERR-NOT-FOUND))
+    )
+    (asserts! (is-none existing-referral) ERR-ALREADY-REFERRED)
+    (asserts! (not (is-eq tx-sender referrer)) ERR-SELF-REFERRAL)
+    (asserts! (get active referral-link) ERR-REFERRAL-EXPIRED)
+    (asserts! (< (get total-referrals referrer-data) (var-get max-referrals-per-user)) ERR-MAX-REFERRALS-REACHED)
+    (asserts! (<= (- burn-block-height (get created-at referral-link)) (var-get referral-expiry-blocks)) ERR-REFERRAL-EXPIRED)
+    
+    (map-set referrals
+      { user: tx-sender }
+      {
+        referrer: (some referrer),
+        referral-code: "",
+        total-referrals: u0,
+        successful-referrals: u0,
+        total-earned-from-referrals: u0,
+        joined-at: burn-block-height
+      }
+    )
+    
+    (map-set referrals
+      { user: referrer }
+      (merge referrer-data { total-referrals: (+ (get total-referrals referrer-data) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-referral-reward (referee principal))
+  (let
+    (
+      (referee-data (unwrap! (map-get? referrals { user: referee }) ERR-NOT-FOUND))
+      (referrer (unwrap! (get referrer referee-data) ERR-NOT-FOUND))
+      (referrer-data (unwrap! (map-get? referrals { user: referrer }) ERR-NOT-FOUND))
+      (existing-reward (map-get? referral-rewards { referrer: referrer, referee: referee }))
+      (referee-reputation (ft-get-balance reputation-token referee))
+    )
+    (asserts! (is-eq tx-sender referrer) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none existing-reward) ERR-REWARD-ALREADY-CLAIMED)
+    (asserts! (>= referee-reputation (var-get min-stake-amount)) ERR-INSUFFICIENT-REPUTATION)
+    
+    (let
+      (
+        (referrer-reward (var-get referral-reward-amount))
+        (referee-reward (/ (var-get referral-reward-amount) u2))
+      )
+      (try! (ft-mint? reputation-token referrer-reward referrer))
+      (try! (ft-mint? reputation-token referee-reward referee))
+      
+      (map-set referral-rewards
+        { referrer: referrer, referee: referee }
+        {
+          referrer-reward: referrer-reward,
+          referee-reward: referee-reward,
+          claimed-at: burn-block-height,
+          referee-qualified: true
+        }
+      )
+      
+      (map-set referrals
+        { user: referrer }
+        (merge referrer-data {
+          successful-referrals: (+ (get successful-referrals referrer-data) u1),
+          total-earned-from-referrals: (+ (get total-earned-from-referrals referrer-data) referrer-reward)
+        })
+      )
+      
+      (ok { referrer-reward: referrer-reward, referee-reward: referee-reward })
+    )
+  )
+)
+
+(define-public (deactivate-referral-code (code (string-ascii 20)))
+  (let
+    (
+      (referral-link (unwrap! (map-get? referral-links { referral-code: code }) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner referral-link)) ERR-NOT-AUTHORIZED)
+    
+    (map-set referral-links
+      { referral-code: code }
+      (merge referral-link { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-referral-data (user principal))
+  (map-get? referrals { user: user })
+)
+
+(define-read-only (get-referral-link-data (code (string-ascii 20)))
+  (map-get? referral-links { referral-code: code })
+)
+
+(define-read-only (get-referral-reward-data (referrer principal) (referee principal))
+  (map-get? referral-rewards { referrer: referrer, referee: referee })
+)
+
+(define-read-only (get-referral-stats (user principal))
+  (let
+    (
+      (referral-data (map-get? referrals { user: user }))
+    )
+    (match referral-data
+      data (ok {
+        total-referrals: (get total-referrals data),
+        successful-referrals: (get successful-referrals data),
+        total-earned: (get total-earned-from-referrals data),
+        conversion-rate: (if (> (get total-referrals data) u0)
+          (/ (* (get successful-referrals data) u100) (get total-referrals data))
+          u0
+        )
+      })
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+(define-read-only (get-referral-system-config)
+  (ok {
+    referral-reward-amount: (var-get referral-reward-amount),
+    referral-expiry-blocks: (var-get referral-expiry-blocks),
+    max-referrals-per-user: (var-get max-referrals-per-user),
+    min-referrer-reputation: (var-get min-referrer-reputation)
+  })
+)
