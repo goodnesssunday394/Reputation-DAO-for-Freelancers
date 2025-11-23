@@ -1076,3 +1076,229 @@
     min-referrer-reputation: (var-get min-referrer-reputation)
   })
 )
+
+(define-constant ERR-SUBSCRIPTION-NOT-FOUND (err u700))
+(define-constant ERR-SUBSCRIPTION-ACTIVE (err u701))
+(define-constant ERR-INVALID-TIER (err u702))
+(define-constant ERR-SUBSCRIPTION-EXPIRED (err u703))
+
+(define-data-var basic-tier-cost uint u100)
+(define-data-var pro-tier-cost uint u300)
+(define-data-var elite-tier-cost uint u600)
+(define-data-var subscription-duration-blocks uint u4320)
+
+(define-map subscriptions
+  { freelancer-id: uint }
+  {
+    tier: uint,
+    started-at: uint,
+    expires-at: uint,
+    auto-renew: bool,
+    total-payments: uint
+  }
+)
+
+(define-map tier-benefits
+  { tier: uint }
+  {
+    visibility-boost: uint,
+    fee-discount: uint,
+    max-projects: uint,
+    priority-support: bool
+  }
+)
+
+(define-public (initialize-tiers)
+  (begin
+    (map-set tier-benefits
+      { tier: u1 }
+      {
+        visibility-boost: u10,
+        fee-discount: u5,
+        max-projects: u5,
+        priority-support: false
+      }
+    )
+    (map-set tier-benefits
+      { tier: u2 }
+      {
+        visibility-boost: u25,
+        fee-discount: u15,
+        max-projects: u15,
+        priority-support: false
+      }
+    )
+    (map-set tier-benefits
+      { tier: u3 }
+      {
+        visibility-boost: u50,
+        fee-discount: u30,
+        max-projects: u50,
+        priority-support: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (subscribe-to-tier (freelancer-id uint) (tier uint) (auto-renew bool))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (existing-sub (map-get? subscriptions { freelancer-id: freelancer-id }))
+      (tier-cost (get-tier-cost tier))
+    )
+    (asserts! (is-eq tx-sender (get address freelancer)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= tier u1) (<= tier u3)) ERR-INVALID-TIER)
+    (asserts! (>= (ft-get-balance reputation-token tx-sender) tier-cost) ERR-INSUFFICIENT-BALANCE)
+    
+    (match existing-sub
+      sub (asserts! (>= burn-block-height (get expires-at sub)) ERR-SUBSCRIPTION-ACTIVE)
+      true
+    )
+    
+    (try! (ft-transfer? reputation-token tier-cost tx-sender (as-contract tx-sender)))
+    
+    (map-set subscriptions
+      { freelancer-id: freelancer-id }
+      {
+        tier: tier,
+        started-at: burn-block-height,
+        expires-at: (+ burn-block-height (var-get subscription-duration-blocks)),
+        auto-renew: auto-renew,
+        total-payments: (match existing-sub
+          sub (+ (get total-payments sub) tier-cost)
+          tier-cost
+        )
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (renew-subscription (freelancer-id uint))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (subscription (unwrap! (map-get? subscriptions { freelancer-id: freelancer-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+      (tier-cost (get-tier-cost (get tier subscription)))
+    )
+    (asserts! (or (is-eq tx-sender (get address freelancer)) (get auto-renew subscription)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= burn-block-height (get expires-at subscription)) ERR-SUBSCRIPTION-ACTIVE)
+    (asserts! (>= (ft-get-balance reputation-token (get address freelancer)) tier-cost) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (ft-transfer? reputation-token tier-cost (get address freelancer) (as-contract tx-sender)))
+    
+    (map-set subscriptions
+      { freelancer-id: freelancer-id }
+      (merge subscription {
+        started-at: burn-block-height,
+        expires-at: (+ burn-block-height (var-get subscription-duration-blocks)),
+        total-payments: (+ (get total-payments subscription) tier-cost)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (upgrade-subscription (freelancer-id uint) (new-tier uint))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (subscription (unwrap! (map-get? subscriptions { freelancer-id: freelancer-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+      (current-tier (get tier subscription))
+      (tier-cost (get-tier-cost new-tier))
+    )
+    (asserts! (is-eq tx-sender (get address freelancer)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-tier u1) (<= new-tier u3)) ERR-INVALID-TIER)
+    (asserts! (> new-tier current-tier) ERR-INVALID-TIER)
+    (asserts! (< burn-block-height (get expires-at subscription)) ERR-SUBSCRIPTION-EXPIRED)
+    (asserts! (>= (ft-get-balance reputation-token tx-sender) tier-cost) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (ft-transfer? reputation-token tier-cost tx-sender (as-contract tx-sender)))
+    
+    (map-set subscriptions
+      { freelancer-id: freelancer-id }
+      (merge subscription {
+        tier: new-tier,
+        total-payments: (+ (get total-payments subscription) tier-cost)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (toggle-auto-renew (freelancer-id uint))
+  (let
+    (
+      (freelancer (unwrap! (map-get? freelancers { id: freelancer-id }) ERR-NOT-FOUND))
+      (subscription (unwrap! (map-get? subscriptions { freelancer-id: freelancer-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get address freelancer)) ERR-NOT-AUTHORIZED)
+    
+    (map-set subscriptions
+      { freelancer-id: freelancer-id }
+      (merge subscription { auto-renew: (not (get auto-renew subscription)) })
+    )
+    
+    (ok (not (get auto-renew subscription)))
+  )
+)
+
+(define-read-only (get-subscription (freelancer-id uint))
+  (map-get? subscriptions { freelancer-id: freelancer-id })
+)
+
+(define-read-only (get-tier-benefits (tier uint))
+  (map-get? tier-benefits { tier: tier })
+)
+
+(define-read-only (is-subscription-active (freelancer-id uint))
+  (match (map-get? subscriptions { freelancer-id: freelancer-id })
+    subscription (ok (< burn-block-height (get expires-at subscription)))
+    (ok false)
+  )
+)
+
+(define-read-only (get-subscription-status (freelancer-id uint))
+  (let
+    (
+      (subscription (map-get? subscriptions { freelancer-id: freelancer-id }))
+    )
+    (match subscription
+      sub (ok {
+        tier: (get tier sub),
+        active: (< burn-block-height (get expires-at sub)),
+        blocks-remaining: (if (< burn-block-height (get expires-at sub))
+          (- (get expires-at sub) burn-block-height)
+          u0
+        ),
+        auto-renew: (get auto-renew sub),
+        total-spent: (get total-payments sub)
+      })
+      ERR-SUBSCRIPTION-NOT-FOUND
+    )
+  )
+)
+
+(define-private (get-tier-cost (tier uint))
+  (if (is-eq tier u1)
+    (var-get basic-tier-cost)
+    (if (is-eq tier u2)
+      (var-get pro-tier-cost)
+      (var-get elite-tier-cost)
+    )
+  )
+)
+
+(define-read-only (get-subscription-config)
+  (ok {
+    basic-tier-cost: (var-get basic-tier-cost),
+    pro-tier-cost: (var-get pro-tier-cost),
+    elite-tier-cost: (var-get elite-tier-cost),
+    subscription-duration-blocks: (var-get subscription-duration-blocks)
+  })
+)
